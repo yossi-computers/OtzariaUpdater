@@ -1407,23 +1407,26 @@ $timer.Add_Tick({
             elseif ($line -eq "DONE") {
                 $script:VCDownloading = $false
                 $libProgBar.Value = 100
-                $libStatusLbl.Text = "מתקין VC++..."
+                $libStatusLbl.Text = "מתקין VC++ AIO..."
                 [System.Windows.Forms.Application]::DoEvents()
                 
-                # Install
-                $proc = Start-Process -FilePath $script:VCFile -ArgumentList "/install /quiet /norestart" -Wait -PassThru
+                # Install - AIO uses /ai for silent install (auto install all)
+                $proc = Start-Process -FilePath $script:VCFile -ArgumentList "/ai" -Wait -PassThru
                 
                 $libProgBar.Value = 0
                 $libStatusLbl.Visible = $false
                 $btnVCRedist.Text = "התקנת הרחבה"
                 
-                if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                if ($proc.ExitCode -eq 0) {
                     Show-RTLMessageBox "ההתקנה הושלמה בהצלחה!" "הצלחה" "OK" "Information"
                     $btnVCRedist.Visible = $false
                     $btnClearCache.Location = New-Object System.Drawing.Point(235,685)
                 } else {
                     Show-RTLMessageBox "ההתקנה נכשלה. קוד שגיאה: $($proc.ExitCode)" "שגיאה" "OK" "Error"
                 }
+                
+                # Delete installer file from TEMP
+                Remove-Item $script:VCFile -Force -ErrorAction SilentlyContinue
                 
                 try { [TBProg]::SetState($form.Handle, 0) } catch { }
                 Remove-Job -Job $script:VCDownloadJob -Force -ErrorAction SilentlyContinue; $script:VCDownloadJob = $null
@@ -1684,8 +1687,12 @@ $form.Add_Shown({
     # Check if VC++ Redistributable is installed
     if (-not (Test-VCRedistInstalled)) {
         $btnVCRedist.Visible = $true
-        # Adjust button positions
-        $btnClearCache.Location = New-Object System.Drawing.Point(50,685)
+        # Center both buttons - total width = 250 (cache) + 20 (gap) + 180 (VC) = 450
+        # Form width is 700, so startX = (700 - 450) / 2 = 125
+        $totalWidth = $btnClearCache.Width + 20 + $btnVCRedist.Width
+        $startX = [int]((700 - $totalWidth) / 2)
+        $btnClearCache.Location = New-Object System.Drawing.Point($startX, 685)
+        $btnVCRedist.Location = New-Object System.Drawing.Point(($startX + $btnClearCache.Width + 20), 685)
     }
     
     $script:InstallPath = Find-OtzariaInstallPath
@@ -4087,12 +4094,7 @@ $btnVCRedist.Add_Click({
     # Start download
     $r = Show-RTLMessageBox "האם להתקין את Visual C++ Redistributable?`n`nזוהי חבילה נדרשת להפעלת תוכנת אוצריא." "התקנת הרחבה" "YesNo" "Question"
     if ($r -eq "Yes") {
-        # Create VCR folder in current directory
-        $vcrFolder = Join-Path (Get-Location).Path "VCR"
-        if (-not (Test-Path $vcrFolder)) {
-            New-Item -ItemType Directory -Path $vcrFolder -Force | Out-Null
-        }
-        $vcFile = Join-Path $vcrFolder "vc_redist.x64.exe"
+        $vcFile = Join-Path $env:TEMP "VisualCppRedist_AIO_x86_x64.exe"
         $vcStopFile = "$env:TEMP\otzaria_vc_stop.flag"
         
         # Remove stop flag if exists
@@ -4103,6 +4105,33 @@ $btnVCRedist.Add_Click({
         $script:VCDownloading = $true
         $script:VCStopFile = $vcStopFile
         
+        # Get latest release URL from GitHub
+        $libStatusLbl.Visible = $true
+        $libStatusLbl.Text = "מחפש גרסה אחרונה..."
+        [System.Windows.Forms.Application]::DoEvents()
+        
+        $vcUrl = $null
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+            $releases = Invoke-RestMethod "https://api.github.com/repos/abbodi1406/vcredist/releases/latest" -Headers @{"User-Agent"="PS"} -TimeoutSec 15
+            $asset = $releases.assets | Where-Object { $_.name -eq "VisualCppRedist_AIO_x86_x64.exe" } | Select-Object -First 1
+            if ($asset) {
+                $vcUrl = $asset.browser_download_url
+            }
+        } catch {
+            $libStatusLbl.Text = "שגיאה בחיפוש גרסה: $_"
+            $btnVCRedist.Text = "התקנת הרחבה"
+            $script:VCDownloading = $false
+            return
+        }
+        
+        if (-not $vcUrl) {
+            $libStatusLbl.Text = "לא נמצא קובץ להורדה"
+            $btnVCRedist.Text = "התקנת הרחבה"
+            $script:VCDownloading = $false
+            return
+        }
+        
         # Start download job
         $script:VCDownloadJob = Start-Job -ScriptBlock {
             param($url, $file, $stopFile)
@@ -4112,6 +4141,8 @@ $btnVCRedist.Add_Click({
                 # Get file size
                 $request = [System.Net.HttpWebRequest]::Create($url)
                 $request.Method = "HEAD"
+                $request.UserAgent = "PS"
+                $request.AllowAutoRedirect = $true
                 $response = $request.GetResponse()
                 $totalSize = $response.ContentLength
                 $response.Close()
@@ -4120,6 +4151,8 @@ $btnVCRedist.Add_Click({
                 
                 # Download with large buffer for speed
                 $webRequest = [System.Net.HttpWebRequest]::Create($url)
+                $webRequest.UserAgent = "PS"
+                $webRequest.AllowAutoRedirect = $true
                 $webResponse = $webRequest.GetResponse()
                 $stream = $webResponse.GetResponseStream()
                 $fileStream = [System.IO.File]::Create($file)
@@ -4155,13 +4188,13 @@ $btnVCRedist.Add_Click({
             } catch {
                 Write-Output "ERROR:$_"
             }
-        } -ArgumentList "https://aka.ms/vs/17/release/vc_redist.x64.exe", $vcFile, $vcStopFile
+        } -ArgumentList $vcUrl, $vcFile, $vcStopFile
         
         $script:VCFile = $vcFile
         $script:VCTotalSize = 0
         
         $libStatusLbl.Visible = $true
-        $libStatusLbl.Text = "מוריד VC++..."
+        $libStatusLbl.Text = "מוריד VC++ AIO..."
         $libProgBar.Value = 0
     }
 })
