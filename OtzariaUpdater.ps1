@@ -1477,7 +1477,9 @@ $timer.Add_Tick({
                 $script:DiffUpdateJob = $null
                 
                 # Get the updated ZIP file and rename it according to the new version
-                $zipFile = Get-ChildItem "." -Filter "*otzaria_*.zip" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $zipFile = Get-ChildItem "." -Filter "*otzaria_*.zip" -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -notlike "*Updater*" } |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 if (-not $zipFile) { $zipFile = Get-Item "otzaria_latest.zip" -ErrorAction SilentlyContinue }
                 if ($zipFile) {
                     $newVer = Get-ZipLibVersion $zipFile.FullName
@@ -1492,25 +1494,31 @@ $timer.Add_Tick({
                                     Remove-Item $newPath -Force
                                 }
                                 Rename-Item $zipFile.FullName $newFileName -Force
+                                $script:LibFileToExtract = $newFileName
                                 $libStatusLbl.Text = "העדכון הושלם! הקובץ שונה ל-$newFileName"
                             } catch {
+                                $script:LibFileToExtract = $zipFile.Name
                                 $libStatusLbl.Text = "העדכון הושלם בהצלחה!"
                             }
+                        } else {
+                            $script:LibFileToExtract = $zipFile.Name
                         }
                         # Update displayed version
                         $lblLibV.Text = "גרסה בארכיון: $newVer   |   גרסה בשרת: $($script:LibVer)"
+                    } else {
+                        $script:LibFileToExtract = $zipFile.Name
                     }
                     
-                    # Show extract button centered
+                    # Hide other buttons and show only extract button centered
+                    $btnLibDL.Visible = $false
+                    $btnLibUpdate.Visible = $false
+                    $btnLibSelectFile.Visible = $false
+                    
                     $btnLibExtract.Text = "חלץ לאוצריא"
                     $btnLibExtract.Size = New-Object System.Drawing.Size(180,34)
                     $btnLibExtract.Location = New-Object System.Drawing.Point(237,72)
                     $btnLibExtract.Visible = $true
                 }
-                
-                # Refresh the UI after a short delay
-                Start-Sleep -Milliseconds 500
-                $btnRefresh.PerformClick()
             }
             elseif ($line -eq "STOPPED") {
                 $script:DiffIsUpdating = $false
