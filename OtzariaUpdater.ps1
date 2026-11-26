@@ -676,7 +676,353 @@ function Get-LatestLibraryRelease {
     $r = ConvertFrom-Json -InputObject (Get-WebText "https://api.github.com/repos/$($script:LibRepo)/releases/latest")
     $ver = $null; if ([string]$r.tag_name -match '^v(\d+)') { $ver = $matches[1] }
     $changes = @($r.assets) | Where-Object { $_.name -eq 'library-changes.md' } | Select-Object -First 1
-    return [pscustomobject]@{ Tag = [string]$r.tag_name; Version = $ver; Date = (ConvertTo-LocalDate $r.published_at); ChangesUrl = $(if ($changes) { [string]$changes.browser_download_url } else { $null }) }
+    $assets = @{}
+    foreach ($a in @($r.assets)) {
+        if (-not $a) { continue }
+        $sha = ''; if ($a.digest -and ([string]$a.digest) -like 'sha256:*') { $sha = ([string]$a.digest).Substring(7) }
+        $assets[[string]$a.name] = [pscustomobject]@{ Url = [string]$a.browser_download_url; Size = [long]$a.size; Sha256 = $sha }
+    }
+    return [pscustomobject]@{ Tag = [string]$r.tag_name; Version = $ver; Date = (ConvertTo-LocalDate $r.published_at); ChangesUrl = $(if ($changes) { [string]$changes.browser_download_url } else { $null }); Assets = $assets }
+}
+
+# ---------------------------------------------------------------------
+# Library delta update (patch-vX-vY.db.zst) - same files Otzaria itself downloads.
+# The patch is a SQLite DB with upsert_<table>/delete_<table>; applied in one
+# transaction (mirrors PatchApplier of Otzaria/otzaria_library_updater, without
+# the logical content hash - a simpler row check is done instead).
+# ---------------------------------------------------------------------
+$script:PatchRx = '^patch-v(\d+)-v(\d+)\.db\.zst$'
+
+# A patch smaller than this is a placeholder for "full rebase" (not a real delta)
+$script:MinPatchSize = 16KB
+$script:PatchEdges = @()   # online: every patch in the recent library releases
+
+# All patches in the recent library releases (each release vN carries patch-vX-vN from several X)
+function Get-LibraryPatchEdges {
+    $list = ConvertFrom-Json -InputObject (Get-WebText "https://api.github.com/repos/$($script:LibRepo)/releases?per_page=40")
+    $edges = @()
+    foreach ($r in @($list)) {
+        if (-not $r -or $r.draft -or [string]$r.tag_name -notmatch '^v\d+-') { continue }
+        $man = @{}
+        foreach ($a in @($r.assets)) { if ($a -and [string]$a.name -like 'patch-*.manifest.json') { $man[[string]$a.name] = [string]$a.browser_download_url } }
+        foreach ($a in @($r.assets)) {
+            if (-not $a -or [string]$a.name -notmatch $script:PatchRx) { continue }
+            $from = [int]$matches[1]; $to = [int]$matches[2]
+            if ($from -ge $to -or [long]$a.size -lt $script:MinPatchSize) { continue }
+            $mu = $man["$($a.name).manifest.json"]; if (-not $mu) { continue }
+            $sha = ''; if ($a.digest -and ([string]$a.digest) -like 'sha256:*') { $sha = ([string]$a.digest).Substring(7) }
+            $edges += [pscustomobject]@{ From = $from; To = $to; Name = [string]$a.name; Size = [long]$a.size; Url = [string]$a.browser_download_url; Sha256 = $sha; ManifestUrl = $mu }
+        }
+    }
+    return $edges
+}
+
+# Patches already in the downloads folder (with their manifest next to them)
+function Get-LocalPatchEdges {
+    $edges = @()
+    foreach ($f in (Get-ChildItem -LiteralPath $script:WorkDir -File -Filter 'patch-v*.db.zst' -ErrorAction SilentlyContinue)) {
+        if ($f.Name -notmatch $script:PatchRx) { continue }
+        $from = [int]$matches[1]; $to = [int]$matches[2]
+        if ($from -ge $to -or $f.Length -lt $script:MinPatchSize -or -not (Test-Path -LiteralPath "$($f.FullName).manifest.json")) { continue }
+        $edges += [pscustomobject]@{ From = $from; To = $to; Name = $f.Name; Size = $f.Length }
+    }
+    return $edges
+}
+
+# Cheapest chain of patches (by download size) from -> to; $null when there is none
+function Find-PatchPath($Edges, [int]$From, [int]$To) {
+    $dist = @{ $From = 0L }; $prev = @{}; $done = @{}
+    while ($true) {
+        $u = $null
+        foreach ($k in $dist.Keys) { if (-not $done.ContainsKey($k) -and ($null -eq $u -or $dist[$k] -lt $dist[$u])) { $u = $k } }
+        if ($null -eq $u) { return $null }
+        if ($u -eq $To) { break }
+        $done[$u] = $true
+        foreach ($e in @($Edges | Where-Object { $_.From -eq $u -and $_.To -le $To })) {
+            $d = $dist[$u] + $e.Size
+            if (-not $dist.ContainsKey($e.To) -or $d -lt $dist[$e.To]) { $dist[$e.To] = $d; $prev[$e.To] = $e }
+        }
+    }
+    $path = @(); $v = $To
+    while ($v -ne $From) { $e = $prev[$v]; $path = ,$e + $path; $v = $e.From }
+    return ,$path
+}
+
+# Update files for library version $From: ready in the folder (Local), or to download.
+# Steps = @(@{ From; To; Path; Manifest }) in order.
+function Get-PatchTarget([int]$From) {
+    if ($From -le 0) { return $null }
+    $latest = if ($script:LibLatest -and $script:LibLatest.Version) { [int]$script:LibLatest.Version } else { 0 }
+    $mk = { param($p) @($p | ForEach-Object { $zp = Join-Path $script:WorkDir $_.Name; [pscustomobject]@{ From = $_.From; To = $_.To; Path = $zp; Manifest = "$zp.manifest.json" } }) }
+    # 1) files already in the folder - the newest version they reach
+    $loc = @(Get-LocalPatchEdges)
+    $localT = $null
+    foreach ($to in @($loc | ForEach-Object { $_.To } | Sort-Object -Unique -Descending)) {
+        if ($to -le $From) { break }
+        $p = Find-PatchPath $loc $From $to
+        if ($p) {
+            $size = 0L; foreach ($e in $p) { $size += $e.Size }
+            $localT = [pscustomobject]@{ Local = $true; From = $From; To = $to; Size = $size; Steps = (& $mk $p); Items = @() }
+            break
+        }
+    }
+    if ($localT -and $localT.To -ge $latest) { return $localT }
+    # 2) download from the releases
+    if ($latest -gt $From -and @($script:PatchEdges).Count -gt 0) {
+        $p = Find-PatchPath $script:PatchEdges $From $latest
+        if ($p) {
+            $size = 0L; $items = @()
+            foreach ($e in $p) {
+                $zp = Join-Path $script:WorkDir $e.Name
+                $items += @{ Url = $e.ManifestUrl; Path = "$zp.manifest.json"; Size = 0; Sha256 = '' }
+                $items += @{ Url = $e.Url; Path = $zp; Size = $e.Size; Sha256 = $e.Sha256 }
+                $size += $e.Size
+            }
+            return [pscustomobject]@{ Local = $false; From = $From; To = $latest; Size = $size; Steps = (& $mk $p); Items = $items }
+        }
+    }
+    return $localT
+}
+
+# Versions that can be updated with patches (for the "update from version" list)
+function Get-PatchSourceVersions {
+    $latest = if ($script:LibLatest -and $script:LibLatest.Version) { [int]$script:LibLatest.Version } else { 0 }
+    $edges = @($script:PatchEdges) + @(Get-LocalPatchEdges)
+    $top = $latest; foreach ($e in $edges) { if ($e.To -gt $top) { $top = $e.To } }
+    $res = @()
+    foreach ($v in @($edges | ForEach-Object { $_.From } | Sort-Object -Unique -Descending)) {
+        if ($v -lt $top -and (Find-PatchPath $edges $v $top)) { $res += $v }
+    }
+    return $res
+}
+
+# Index folders Otzaria may be using (the app reindexes the books listed in otzaria_pending_reindex.json)
+function Get-IndexDirs {
+    $c = @()
+    if ($script:Library) { $c += (Join-Path (Split-Path -Parent $script:Library.Dir) 'index') }
+    $c += (Join-Path $env:ProgramData 'otzaria\index'), (Join-Path (Get-DataRoot) 'index')
+    return @($c | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'meta.json') } | Select-Object -Unique)
+}
+
+# Background worker: verify, decompress (zstd.exe of Otzaria), apply in one transaction, check, commit.
+# Output lines: STAGE:<text> | PCT:<n> | DONE:<books> | ERROR:<msg>
+$script:PatchWorker = {
+    param([string]$DbPath, [string]$PatchZst, [string]$ManifestJson, [string]$ZstdExe, [string]$SqliteCs, [string]$IndexDirsJson)
+    $ErrorActionPreference = 'Stop'
+    $patchDb = $PatchZst -replace '\.zst$', ''
+    $db = [IntPtr]::Zero; $inTx = $false; $attached = $false
+    function Q([string]$sql, [object[]]$a = $null) { return ,([OtzSql]::Query($db, $sql, $a)) }
+    function X([string]$sql, [object[]]$a = $null) { [OtzSql]::Exec($db, $sql, $a) }
+    function HasT([string]$schema, [string]$name) { return (Q "SELECT 1 FROM $schema.sqlite_master WHERE type='table' AND name=?" @($name)).Count -gt 0 }
+    function Meta([string]$schema, [string]$table, [string]$key) {
+        try { $r = Q "SELECT value FROM $schema.$table WHERE key=? LIMIT 1" @($key); if ($r.Count -gt 0 -and $r[0][0] -ne $null) { return [int]$r[0][0] } } catch { }
+        return $null
+    }
+    try {
+        Add-Type -TypeDefinition $SqliteCs -ErrorAction SilentlyContinue
+        $m = ConvertFrom-Json -InputObject $ManifestJson
+        $pf = @($m.patchFiles)[0]
+        if ($m.fullRebase -or -not $pf) { throw 'קובץ העדכון הזה אינו עדכון רגיל (נדרשת החלפת ספרייה מלאה). יש להשתמש בחבילת הספרייה המלאה.' }
+        if ([int]$m.patchFormatVersion -gt 4) { throw "קובץ העדכון בפורמט חדש ($($m.patchFormatVersion)) שהתוכנה עדיין לא מכירה. יש להשתמש בחבילת הספרייה המלאה או לעדכן מתוך אוצריא." }
+
+        Write-Output 'STAGE:מאמת את קובץ העדכון...'
+        if ([long]$pf.size -gt 0 -and (Get-Item -LiteralPath $PatchZst).Length -ne [long]$pf.size) { throw 'קובץ העדכון לא שלם. יש להוריד אותו מחדש.' }
+        if ($pf.sha256 -and (Get-FileHash -LiteralPath $PatchZst -Algorithm SHA256).Hash.ToLowerInvariant() -ne ([string]$pf.sha256).ToLowerInvariant()) { throw 'קובץ העדכון פגום (בדיקת SHA256 נכשלה). יש להוריד אותו מחדש.' }
+
+        Write-Output 'STAGE:פותח את קובץ העדכון...'
+        $tmp = "$patchDb.extracting"
+        Remove-Item -LiteralPath $tmp, $patchDb -Force -ErrorAction SilentlyContinue
+        $zo = & $ZstdExe -d -q -f -o $tmp $PatchZst 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) { throw "פתיחת קובץ העדכון נכשלה: $zo" }
+        if ([long]$pf.uncompressedSize -gt 0 -and (Get-Item -LiteralPath $tmp).Length -ne [long]$pf.uncompressedSize) { throw 'קובץ העדכון שנפתח אינו בגודל הצפוי.' }
+        if ($pf.uncompressedSha256 -and (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant() -ne ([string]$pf.uncompressedSha256).ToLowerInvariant()) { throw 'קובץ העדכון שנפתח פגום (SHA256).' }
+        Move-Item -LiteralPath $tmp -Destination $patchDb -Force
+
+        Write-Output 'STAGE:בודק את הספרייה במחשב...'
+        $db = [OtzSql]::Open($DbPath, $true)
+        X 'PRAGMA foreign_keys = ON'
+        X 'PRAGMA cache_size = -262144'
+        $lv = Meta 'main' 'schema_meta' 'db_version'
+        $ls = Meta 'main' 'schema_meta' 'db_schema_version'
+        if ($lv -ne [int]$m.fromVersion) { throw "העדכון מיועד לספרייה בגרסה $($m.fromVersion), אבל הספרייה במחשב בגרסה $lv." }
+        if ($ls -ne $null -and $ls -ne [int]$m.fromSchemaVersion) { throw "העדכון מיועד לסכמה $($m.fromSchemaVersion), אבל הספרייה במחשב בסכמה $ls." }
+
+        X 'ATTACH DATABASE ? AS patch' @($patchDb)
+        $attached = $true
+        $fmt = Meta 'patch' 'patch_meta' 'schema_version'
+        if ($fmt -eq $null -or $fmt -lt 1 -or $fmt -gt 4) { throw "פורמט קובץ העדכון ($fmt) אינו נתמך." }
+        if ($m.patchFormatVersion -and $fmt -ne [int]$m.patchFormatVersion) { throw 'קובץ העדכון אינו תואם לקובץ התיאור (manifest) שלו.' }
+        if ((Meta 'patch' 'patch_meta' 'from_version') -ne [int]$m.fromVersion -or (Meta 'patch' 'patch_meta' 'to_version') -ne [int]$m.toVersion) { throw 'טווח הגרסאות בקובץ העדכון אינו תואם לקובץ התיאור (manifest) שלו.' }
+
+        # name, primary key, updatable - FK order (kPatchTablesInFkOrder)
+        $specs = @(
+            @('source','id',1), @('author','id',1), @('topic','id',1), @('pub_place','id',1), @('pub_date','id',1),
+            @('connection_type','id',1), @('tocText','id',1), @('generation','id',1), @('category','id',1),
+            @('category_closure','ancestorId,descendantId',0), @('book','id',1), @('book_author','bookId,authorId',0),
+            @('book_base_text','bookId,baseBookId',0), @('book_topic','bookId,topicId',0), @('book_pub_place','bookId,pubPlaceId',0),
+            @('book_pub_date','bookId,pubDateId',0), @('book_acronym','bookId,term',0), @('book_generation','bookId,generationId',0),
+            @('tocEntry','id',1), @('line','id',1), @('line_content','id',1), @('zstd_dict','id',1), @('line_toc','lineId',1),
+            @('line_ref','bookId,refKeyHash,lineIndex',0), @('line_dh','bookId,dhText,lineIndex',1), @('link','id',1),
+            @('link_anchor','linkId,side,charStart',1), @('link_range','linkId,side',1), @('link_coverage','lineId,linkId,side',0),
+            @('link_suppressed_side','linkId,side',1), @('book_has_links','bookId',1), @('book_version','id',1),
+            @('version_line','versionId,lineId',1), @('alt_toc_structure','id',1), @('alt_toc_entry','id',1),
+            @('line_alt_toc','lineId,structureId',1), @('default_commentator','bookId,commentatorBookId',1),
+            @('default_targum','bookId,targumBookId',1), @('banner','id',1), @('book_banner','bookId',1),
+            @('book_protection','bookId',1), @('line_divine_name','lineId,charStart',1), @('line_note','lineId,noteIndex',1),
+            @('line_note_divine_name','lineId,noteIndex,charStart',1), @('schema_meta','key',1)
+        )
+        $work = @()
+        foreach ($s in $specs) {
+            if (HasT 'patch' "upsert_$($s[0])") { $work += ,@('upsert', $s) }
+            if (HasT 'patch' "delete_$($s[0])") { $work += ,@('delete', $s) }
+        }
+        $steps = [Math]::Max(1, $work.Count + 2); $step = 0
+        $known = @{}; foreach ($s in $specs) { $known[$s[0]] = $true }
+        foreach ($t in (Q "SELECT name FROM patch.sqlite_master WHERE type='table' AND (name LIKE 'upsert\_%' ESCAPE '\' OR name LIKE 'delete\_%' ESCAPE '\')")) {
+            $base = ([string]$t[0]) -replace '^(upsert|delete)_', ''
+            if (-not $known.ContainsKey($base)) { throw "קובץ העדכון כולל טבלה שהתוכנה לא מכירה ($base). יש לעדכן מתוך אוצריא או להשתמש בחבילת הספרייה המלאה." }
+        }
+
+        Write-Output 'STAGE:מתקין את העדכון...'
+        X 'BEGIN'
+        $inTx = $true
+        X 'PRAGMA defer_foreign_keys = ON'
+        if (HasT 'patch' 'migrations') { foreach ($r in (Q 'SELECT sql FROM patch.migrations ORDER BY version ASC')) { X ([string]$r[0]) } }
+
+        $cols = @{}
+        foreach ($s in $specs) {
+            $pt = "upsert_$($s[0])"
+            if (-not (HasT 'patch' $pt)) { continue }
+            $c = @(foreach ($r in (Q "PRAGMA patch.table_info(`"$pt`")")) { [string]$r[1] })
+            $cols[$s[0]] = $c
+            $step++; Write-Output "STAGE:מתקין את העדכון: $($s[0])"; Write-Output "PCT:$([int]($step * 100 / $steps))"
+            if ($c.Count -eq 0) { continue }
+            $pk = @($s[1] -split ',')
+            $colsCsv = ($c | ForEach-Object { "`"$_`"" }) -join ','
+            $pkCsv = ($pk | ForEach-Object { "`"$_`"" }) -join ','
+            $nonPk = @($c | Where-Object { $pk -notcontains $_ })
+            if ($s[2] -eq 0 -or $nonPk.Count -eq 0) { $conflict = "ON CONFLICT($pkCsv) DO NOTHING" }
+            else {
+                $set = ($nonPk | ForEach-Object { "`"$_`" = excluded.`"$_`"" }) -join ','
+                $chg = ($nonPk | ForEach-Object { "`"$($s[0])`".`"$_`" IS NOT excluded.`"$_`" COLLATE BINARY OR typeof(`"$($s[0])`".`"$_`") IS NOT typeof(excluded.`"$_`")" }) -join ' OR '
+                $conflict = "ON CONFLICT($pkCsv) DO UPDATE SET $set WHERE $chg"
+            }
+            try { X "INSERT INTO `"$($s[0])`" ($colsCsv) SELECT $colsCsv FROM patch.`"$pt`" WHERE true $conflict" }
+            catch {
+                if ($_.Exception.Message -match 'constraint') { throw "העדכון אינו מתאים לספרייה שבמחשב (התנגשות בטבלה $($s[0])). יש להשתמש בחבילת הספרייה המלאה." }
+                throw
+            }
+        }
+
+        # Books whose content changed - Otzaria reindexes them (mirrors _collectBooksTouched)
+        $books = New-Object 'System.Collections.Generic.HashSet[long]'
+        $collect = {
+            param([string]$pt, [string]$sql, [string[]]$joins)
+            if (-not (HasT 'patch' $pt)) { return }
+            foreach ($j in $joins) { if (-not (HasT 'main' $j)) { return } }
+            foreach ($r in (Q $sql)) { if ($r[0] -ne $null) { [void]$books.Add([long]$r[0]) } }
+        }
+        & $collect 'upsert_book' 'SELECT DISTINCT id FROM patch.upsert_book' @()
+        & $collect 'delete_book' 'SELECT DISTINCT id FROM patch.delete_book' @()
+        foreach ($op in 'upsert', 'delete') {
+            & $collect "${op}_line" "SELECT DISTINCT l.bookId FROM patch.${op}_line p JOIN main.line l ON l.id = p.id" @('line')
+            & $collect "${op}_line_content" "SELECT DISTINCT l.bookId FROM patch.${op}_line_content p JOIN main.line l ON l.id = p.id" @('line')
+            & $collect "${op}_tocEntry" "SELECT DISTINCT t.bookId FROM patch.${op}_tocEntry p JOIN main.tocEntry t ON t.id = p.id" @('tocEntry')
+            & $collect "${op}_line_note" "SELECT DISTINCT l.bookId FROM patch.${op}_line_note p JOIN main.line l ON l.id = p.lineId" @('line')
+            & $collect "${op}_line_toc" "SELECT DISTINCT l.bookId FROM patch.${op}_line_toc p JOIN main.line l ON l.id = p.lineId" @('line')
+            & $collect "${op}_tocText" "SELECT DISTINCT t.bookId FROM patch.${op}_tocText p JOIN main.tocEntry t ON t.textId = p.id" @('tocEntry')
+            & $collect "${op}_tocText" "SELECT DISTINCT s.bookId FROM patch.${op}_tocText p JOIN main.alt_toc_entry a ON a.textId = p.id JOIN main.alt_toc_structure s ON s.id = a.structureId" @('alt_toc_entry', 'alt_toc_structure')
+            & $collect "${op}_alt_toc_structure" "SELECT DISTINCT s.bookId FROM patch.${op}_alt_toc_structure p JOIN main.alt_toc_structure s ON s.id = p.id" @('alt_toc_structure')
+            & $collect "${op}_alt_toc_entry" "SELECT DISTINCT s.bookId FROM patch.${op}_alt_toc_entry p JOIN main.alt_toc_entry a ON a.id = p.id JOIN main.alt_toc_structure s ON s.id = a.structureId" @('alt_toc_entry', 'alt_toc_structure')
+            & $collect "${op}_line_alt_toc" "SELECT DISTINCT l.bookId FROM patch.${op}_line_alt_toc p JOIN main.line l ON l.id = p.lineId" @('line')
+            foreach ($t in 'book_author', 'book_topic', 'book_acronym', 'book_base_text') { & $collect "${op}_$t" "SELECT DISTINCT bookId FROM patch.${op}_$t" @() }
+            & $collect "${op}_book_base_text" "SELECT DISTINCT baseBookId FROM patch.${op}_book_base_text" @()
+        }
+
+        $rev = @($specs); [array]::Reverse($rev)
+        foreach ($s in $rev) {
+            $dt = "delete_$($s[0])"
+            if (-not (HasT 'patch' $dt)) { continue }
+            $step++; Write-Output "STAGE:מתקין את העדכון: מחיקות מ-$($s[0])"; Write-Output "PCT:$([int]($step * 100 / $steps))"
+            $pk = @($s[1] -split ','); $pkCsv = ($pk | ForEach-Object { "`"$_`"" }) -join ','
+            $target = if ($pk.Count -eq 1) { $pkCsv } else { "($pkCsv)" }
+            X "DELETE FROM `"$($s[0])`" WHERE $target IN (SELECT $pkCsv FROM patch.`"$dt`")"
+        }
+
+        if (HasT 'patch' 'stat1_snapshot') {
+            if (-not (HasT 'main' 'sqlite_stat1')) { X 'ANALYZE main.sqlite_schema' }
+            X 'DELETE FROM main.sqlite_stat1'
+            X 'INSERT INTO main.sqlite_stat1 (tbl, idx, stat) SELECT tbl, idx, stat FROM patch.stat1_snapshot'
+            if (HasT 'main' 'sqlite_stat4') { X 'DELETE FROM main.sqlite_stat4' }
+        }
+
+        # Simple check (instead of the full content hash): version, and every patch row landed / was removed
+        $step++; Write-Output 'STAGE:בודק את התוצאה...'; Write-Output "PCT:$([int]($step * 100 / $steps))"
+        $nv = Meta 'main' 'schema_meta' 'db_version'
+        if ($nv -ne [int]$m.toVersion) { throw "אחרי ההתקנה גרסת הספרייה היא $nv במקום $($m.toVersion)." }
+        $ns = Meta 'main' 'schema_meta' 'db_schema_version'
+        if ($ns -ne $null -and $m.toSchemaVersion -and $ns -ne [int]$m.toSchemaVersion) { throw "אחרי ההתקנה הסכמה היא $ns במקום $($m.toSchemaVersion)." }
+        $bad = @()
+        foreach ($s in $specs) {
+            $pk = @($s[1] -split ',')
+            if ($cols.ContainsKey($s[0]) -and $cols[$s[0]].Count -gt 0) {
+                $skipDel = if (HasT 'patch' "delete_$($s[0])") { ' AND NOT EXISTS (SELECT 1 FROM patch."delete_' + $s[0] + '" d WHERE ' + (($pk | ForEach-Object { "d.`"$_`" = p.`"$_`"" }) -join ' AND ') + ')' } else { '' }
+                $eq = ($cols[$s[0]] | ForEach-Object { "m.`"$_`" IS p.`"$_`"" }) -join ' AND '
+                $n = [long](Q "SELECT count(*) FROM patch.`"upsert_$($s[0])`" p WHERE NOT EXISTS (SELECT 1 FROM main.`"$($s[0])`" m WHERE $eq)$skipDel")[0][0]
+                if ($n -gt 0) { $bad += "$($s[0]) ($n)" }
+            }
+            if (HasT 'patch' "delete_$($s[0])") {
+                $pkCsv = ($pk | ForEach-Object { "`"$_`"" }) -join ','
+                $target = if ($pk.Count -eq 1) { $pkCsv } else { "($pkCsv)" }
+                $n = [long](Q "SELECT count(*) FROM main.`"$($s[0])`" WHERE $target IN (SELECT $pkCsv FROM patch.`"delete_$($s[0])`")")[0][0]
+                if ($n -gt 0) { $bad += "$($s[0]) ($n)" }
+            }
+        }
+        if ($bad.Count -gt 0) { throw "הבדיקה אחרי ההתקנה נכשלה בטבלאות: $($bad -join ', '). הספרייה לא שונתה. יש להשתמש בחבילת הספרייה המלאה." }
+
+        Write-Output 'STAGE:שומר...'
+        try { X 'COMMIT' } catch {
+            if ($_.Exception.Message -match 'FOREIGN KEY') { throw 'העדכון אינו מתאים לספרייה שבמחשב (קשרים בין טבלאות). הספרייה לא שונתה. יש להשתמש בחבילת הספרייה המלאה.' }
+            throw
+        }
+        $inTx = $false
+        X 'DETACH DATABASE patch'; $attached = $false
+        [OtzSql]::Close($db); $db = [IntPtr]::Zero
+
+        # Ask Otzaria to reindex the changed books on next start
+        $keys = @($books | ForEach-Object { "id:$_" })
+        foreach ($dir in @(ConvertFrom-Json -InputObject $IndexDirsJson)) {
+            if (-not $dir) { continue }
+            try {
+                $f = Join-Path $dir 'otzaria_pending_reindex.json'
+                $all = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+                $checkKeys = @(); $checkLib = $false
+                if (Test-Path -LiteralPath $f) {
+                    $old = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($f))
+                    if ($old.version -eq 1) { foreach ($k in @($old.keys)) { if ($k) { [void]$all.Add([string]$k) } }; $checkKeys = @($old.checkKeys | Where-Object { $_ }); $checkLib = [bool]$old.checkLibrary }
+                }
+                foreach ($k in $keys) { [void]$all.Add($k) }
+                if ($all.Count -eq 0 -and -not $checkLib -and $checkKeys.Count -eq 0) { continue }
+                $o = [ordered]@{ version = 1; keys = @($all) }
+                if ($checkLib) { $o.checkLibrary = $true }
+                if ($checkKeys.Count -gt 0) { $o.checkKeys = @($checkKeys | Sort-Object) }
+                $json = ConvertTo-Json -InputObject $o -Compress -Depth 4
+                [IO.File]::WriteAllText("$f.tmp", $json, (New-Object Text.UTF8Encoding($false)))
+                Move-Item -LiteralPath "$f.tmp" -Destination $f -Force
+            } catch { }
+        }
+        Write-Output "PCT:100"
+        Write-Output "DONE:$($books.Count)"
+    } catch {
+        Write-Output ('ERROR:' + $_.Exception.Message)
+    } finally {
+        if ($db -ne [IntPtr]::Zero) {
+            if ($inTx) { try { [OtzSql]::Exec($db, 'ROLLBACK', $null) } catch { } }
+            if ($attached) { try { [OtzSql]::Exec($db, 'DETACH DATABASE patch', $null) } catch { } }
+            [OtzSql]::Close($db)
+        }
+        Remove-Item -LiteralPath $patchDb, "$patchDb.extracting" -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------
@@ -949,7 +1295,7 @@ function Remove-OldInstallers([string]$KeepName, [string]$KeepVersion) {
 # =====================================================================
 $form = New-Object Windows.Forms.Form
 $form.Text = "אוצריא - הורדה ועדכון  (v$($script:UpdaterVersion))"
-$form.ClientSize = New-Object Drawing.Size(705, 868)
+$form.ClientSize = New-Object Drawing.Size(705, 910)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -1058,7 +1404,7 @@ $mainCard.Controls.Add($progBar)
 $statusLbl = New-Lbl $mainCard '' 20 354 615 24 'MiddleCenter'
 
 # --- Library card ---
-$libCard = New-Card 482 262
+$libCard = New-Card 482 304
 $lblLib = New-Lbl $libCard 'ספריית אוצריא' 20 10 615 28 'MiddleCenter' 'strong' 13 'Segoe UI Semibold'
 $div2 = New-Lbl $libCard '' 20 42 615 1 'MiddleCenter' 'divider'
 $lblLibLocalT = New-Lbl $libCard 'במחשב:' 475 50 160 24 'MiddleRight'
@@ -1066,33 +1412,42 @@ $lblLibLocalV = New-Lbl $libCard 'בודק...' 20 50 450 24 'MiddleLeft' 'strong
 $lblLibLatestT = New-Lbl $libCard 'גרסה אחרונה:' 475 76 160 24 'MiddleRight'
 $lblLibLatestV = New-Lbl $libCard 'טוען...' 128 76 342 24 'MiddleLeft' 'strong' 10 'Segoe UI Semibold'
 $btnLibChangelog = New-Btn $libCard 'מה חדש?' 20 75 100 27 9
-$lblLibNote = New-Lbl $libCard ("הספרייה מתעדכנת אוטומטית מתוך אוצריא.`nלמחשב ללא אינטרנט: הורד חבילת ספרייה - המתקין יחלץ אותה.") 20 102 615 42 'MiddleCenter' '' 9
+$lblLibNote = New-Lbl $libCard ("אוצריא מעדכנת את הספרייה בעצמה. כאן אפשר להוריד רק את העדכון - גם למחשב אחר בלי אינטרנט`n(בוחרים את הגרסה שיש בו ומעבירים את הקבצים). להתקנה חדשה: חבילת ספרייה מלאה.") 20 102 615 42 'MiddleCenter' '' 9
 $chkIndex = New-Object Windows.Forms.CheckBox
 $chkIndex.Text = 'כולל אינדקס חיפוש מוכן (למחשבים איטיים)'; $chkIndex.Location = New-Object Drawing.Point(120, 146); $chkIndex.Size = New-Object Drawing.Size(415, 24)
 $chkIndex.Font = New-Object Drawing.Font('Segoe UI', 9.5)
 $libCard.Controls.Add($chkIndex)
 $toolTip.SetToolTip($chkIndex, 'בדרך כלל אין צורך: אוצריא בונה את אינדקס החיפוש בעצמה אחרי ההתקנה')
-$btnLibDL = New-Btn $libCard 'הורדת חבילת ספרייה' 160 174 335 36 10.5
-$btnLibDL.Font = New-Object Drawing.Font('Segoe UI Semibold', 10.5)
+$lblPatchFrom = New-Lbl $libCard 'עדכון מגרסה:' 530 174 105 36 'MiddleRight' '' 9.5
+$cmbPatchFrom = New-Object Windows.Forms.ComboBox
+$cmbPatchFrom.DropDownStyle = 'DropDownList'; $cmbPatchFrom.Location = New-Object Drawing.Point(395, 180); $cmbPatchFrom.Size = New-Object Drawing.Size(130, 26)
+$cmbPatchFrom.Font = New-Object Drawing.Font('Segoe UI', 9.5)
+$libCard.Controls.Add($cmbPatchFrom)
+$toolTip.SetToolTip($cmbPatchFrom, 'הגרסה של הספרייה שרוצים לעדכן. למחשב אחר (למשל בלי אינטרנט) - בחר את הגרסה שיש בו, והתוכנה תוריד את קבצי העדכון המתאימים')
+$btnPatch = New-Btn $libCard 'הורדת עדכון בלבד' 130 174 255 36 10
+$btnPatch.Font = New-Object Drawing.Font('Segoe UI Semibold', 10)
+$btnPatchFile = New-Btn $libCard 'בחר קבצי עדכון...' 505 216 130 36 9.5
+$toolTip.SetToolTip($btnPatchFile, 'התקנת קבצי עדכון ספרייה (patch-vXX-vYY.db.zst) שהועתקו ממחשב אחר. קובץ ה-manifest.json של כל אחד צריך להיות לידו.')
+$btnLibDL = New-Btn $libCard 'הורדת חבילת ספרייה' 130 216 365 36 10
 $btnLibCancel = New-Btn $libCard 'ביטול' 20 174 100 36
 $btnLibCancel.Visible = $false
 $libProgBar = New-Object ModernProgressBar
-$libProgBar.Location = New-Object Drawing.Point(20, 216); $libProgBar.Size = New-Object Drawing.Size(615, 20)
+$libProgBar.Location = New-Object Drawing.Point(20, 258); $libProgBar.Size = New-Object Drawing.Size(615, 20)
 $libCard.Controls.Add($libProgBar)
-$libStatusLbl = New-Lbl $libCard '' 20 237 615 22 'MiddleCenter'
+$libStatusLbl = New-Lbl $libCard '' 20 279 615 22 'MiddleCenter'
 
 # --- Bottom buttons (form level: x is measured from the right) ---
-$btnPlugins = New-Btn $form 'תוספים לאוצריא' 25 756 210 40 10.5
+$btnPlugins = New-Btn $form 'תוספים לאוצריא' 25 798 210 40 10.5
 $btnPlugins.Font = New-Object Drawing.Font('Segoe UI Semibold', 10.5)
-$btnOpenLib = New-Btn $form 'תיקיית הספרייה' 248 756 209 40 10.5
-$btnReset   = New-Btn $form 'איפוס הגדרות' 470 756 210 40 10.5
+$btnOpenLib = New-Btn $form 'תיקיית הספרייה' 248 798 209 40 10.5
+$btnReset   = New-Btn $form 'איפוס הגדרות' 470 798 210 40 10.5
 $toolTip.SetToolTip($btnPlugins, 'התקנה ועדכון של תוספים מחנות התוספים של אוצריא')
 $toolTip.SetToolTip($btnReset, 'מחיקת הגדרות, היסטוריה ומטמון של אוצריא (הספרייה והגיבויים נשמרים)')
 
-$statusDivider = New-Lbl $form '' 25 806 655 1 'MiddleCenter' 'divider'
-$statusLocation = New-Lbl $form '' 25 811 655 20 'MiddleCenter' '' 8.5
-$statusBar = New-Lbl $form '' 25 830 655 20 'MiddleCenter' '' 8.5
-$lblNetwork = New-Lbl $form 'אין חיבור לרשת' 25 848 655 20 'MiddleCenter' 'network' 9.5 'Segoe UI Semibold'
+$statusDivider = New-Lbl $form '' 25 848 655 1 'MiddleCenter' 'divider'
+$statusLocation = New-Lbl $form '' 25 853 655 20 'MiddleCenter' '' 8.5
+$statusBar = New-Lbl $form '' 25 872 655 20 'MiddleCenter' '' 8.5
+$lblNetwork = New-Lbl $form 'אין חיבור לרשת' 25 890 655 20 'MiddleCenter' 'network' 9.5 'Segoe UI Semibold'
 $lblNetwork.ForeColor = [Drawing.Color]::FromArgb(200, 50, 50); $lblNetwork.Visible = $false
 
 # =====================================================================
@@ -1229,9 +1584,39 @@ function Update-AppUI {
     Apply-ThemeTo $mainCard
 }
 
+# "Update from version" list: this computer first, then every version that has update files
+$script:PatchFromValues = @()
+$script:PatchFromUpdating = $false
+function Get-LocalLibVersion { if ($script:Library -and $script:Library.Version) { return [int]$script:Library.Version } return 0 }
+function Get-PatchFromVersion {
+    $i = $cmbPatchFrom.SelectedIndex
+    if ($i -ge 0 -and $i -lt @($script:PatchFromValues).Count) { return [int]$script:PatchFromValues[$i] }
+    return 0
+}
+function Test-PatchForThisPc([int]$From) { return ($From -gt 0 -and $From -eq (Get-LocalLibVersion)) }
+function Update-PatchFromList {
+    $script:PatchFromUpdating = $true
+    try {
+        $keepThis = $cmbPatchFrom.SelectedIndex -le 0
+        $prev = Get-PatchFromVersion
+        $cmbPatchFrom.Items.Clear(); $vals = @()
+        $lv = Get-LocalLibVersion
+        if ($lv -gt 0) { [void]$cmbPatchFrom.Items.Add("המחשב הזה ($lv)"); $vals += $lv }
+        foreach ($v in @(Get-PatchSourceVersions)) { if ($v -ne $lv) { [void]$cmbPatchFrom.Items.Add("גרסה $v"); $vals += $v } }
+        if ($vals.Count -eq 0) { [void]$cmbPatchFrom.Items.Add('-'); $vals += 0 }
+        $script:PatchFromValues = $vals
+        $idx = 0
+        if (-not $keepThis) { for ($i = 0; $i -lt $vals.Count; $i++) { if ($vals[$i] -eq $prev -and -not ($i -eq 0 -and $lv -gt 0)) { $idx = $i; break } } }
+        $cmbPatchFrom.SelectedIndex = $idx
+    } finally { $script:PatchFromUpdating = $false }
+}
+
 function Update-LibUI {
     $active = $script:Active -and $script:Active.Kind -eq 'Lib'
     $paused = $script:Paused.ContainsKey('Lib')
+    $pActive = $script:Active -and $script:Active.Kind -eq 'Patch'
+    $pPaused = $script:Paused.ContainsKey('Patch')
+    $pBusy = $pActive -or $pPaused
     $busy = $active -or $paused
     $lib = $script:Library
     if ($lib) {
@@ -1245,21 +1630,51 @@ function Update-LibUI {
         $lblLibLatestV.Text = "גרסה $($L.Version)  ·  $(Format-Date $L.Date)"; $lblLibLatestV.Tag = 'strong'
         if ($lib -and $lib.Version) {
             if ([int]$lib.Version -ge [int]$L.Version) { $lblLibLatestV.Text += '   ✓ מעודכנת'; $lblLibLatestV.Tag = 'good' }
-            else { $lblLibLatestV.Text += '   ← אוצריא תעדכן אוטומטית'; $lblLibLatestV.Tag = 'warn' }
+            else { $lblLibLatestV.Text += '   ← עדכון זמין'; $lblLibLatestV.Tag = 'warn' }
         }
     } else { $lblLibLatestV.Text = $(if ($script:Online) { 'לא ידוע' } else { 'אין חיבור לרשת' }); $lblLibLatestV.Tag = '' }
     $btnLibChangelog.Enabled = [bool]($L -and $L.ChangesUrl)
 
     $t = Get-LibTarget
     $chkIndex.Enabled = -not $busy
-    $btnLibCancel.Visible = $busy
+    $btnLibCancel.Visible = $busy -or $pBusy
     if ($active) { $btnLibDL.Text = 'עצור'; $btnLibDL.Enabled = $true }
     elseif ($paused) { $btnLibDL.Text = 'המשך'; $btnLibDL.Enabled = -not $script:Active }
     elseif ($t -and $t.Ready) { $btnLibDL.Text = 'התקנה עם הספרייה'; $btnLibDL.Enabled = $true }
-    elseif ($t) { $btnLibDL.Text = "הורדת חבילת ספרייה ($(Format-Size $t.LibSize))"; $btnLibDL.Enabled = -not $script:Active }
-    else { $btnLibDL.Text = 'הורדת חבילת ספרייה'; $btnLibDL.Enabled = $false }
-    if (-not $busy -and -not $script:Active -and $t -and $t.Ready) {
-        $libStatusLbl.Text = "חבילת הספרייה ($($t.Version)) מוכנה בתיקייה, ליד קובץ ההתקנה"; $libProgBar.Value = 100
+    elseif ($t) { $btnLibDL.Text = "הורדת חבילת ספרייה מלאה ($(Format-Size $t.LibSize))"; $btnLibDL.Enabled = -not $script:Active }
+    else { $btnLibDL.Text = 'הורדת חבילת ספרייה מלאה'; $btnLibDL.Enabled = $false }
+    if ($pBusy) { $btnLibDL.Enabled = $false }
+
+    # Update only (patch) - for this computer or for another one (version chosen in the list)
+    $from = Get-PatchFromVersion
+    $thisPc = Test-PatchForThisPc $from
+    $pt = Get-PatchTarget $from
+    $steps = if ($pt) { @($pt.Steps).Count } else { 0 }
+    $tip = ''
+    if ($pt) { $tip = "גרסה $($pt.From) ← $($pt.To): " + ((@($pt.Steps) | ForEach-Object { "$($_.From)→$($_.To)" }) -join ', ') + $(if ($steps -gt 1) { "  ($steps קבצי עדכון)" } else { '' }) }
+    if ($pActive) { $btnPatch.Text = 'עצור'; $btnPatch.Enabled = $true }
+    elseif ($pPaused) { $btnPatch.Text = 'המשך'; $btnPatch.Enabled = -not $script:Active }
+    elseif ($pt -and $pt.Local -and $thisPc) { $btnPatch.Text = "התקנת העדכון לגרסה $($pt.To)"; $btnPatch.Enabled = -not $script:Active }
+    elseif ($pt -and $pt.Local) { $btnPatch.Text = 'הקבצים מוכנים - פתח תיקייה'; $btnPatch.Enabled = $true }
+    elseif ($pt) { $btnPatch.Text = "הורדת עדכון בלבד ($(Format-Size $pt.Size))"; $btnPatch.Enabled = -not $script:Active }
+    else {
+        $btnPatch.Text = 'הורדת עדכון בלבד'; $btnPatch.Enabled = $false
+        $tip = if ($from -le 0) { 'לא נמצאה ספרייה במחשב. אפשר לבחור גרסה של מחשב אחר מהרשימה.' }
+               elseif (-not $L -or -not $L.Version) { 'אין מידע על הגרסה האחרונה (אין חיבור לרשת). אפשר לבחור קבצי עדכון שהועתקו ממחשב אחר.' }
+               elseif ($from -ge [int]$L.Version) { 'הספרייה מעודכנת' }
+               else { "אין קבצי עדכון מגרסה $from - יש להשתמש בחבילת הספרייה המלאה" }
+    }
+    $toolTip.SetToolTip($btnPatch, $tip)
+    $btnPatchFile.Enabled = -not $script:Active -and -not $pPaused -and [bool]$script:Library
+    $cmbPatchFrom.Enabled = -not $pBusy -and -not $script:PatchBusy -and $cmbPatchFrom.Items.Count -gt 1
+    if ($busy) { $btnPatch.Enabled = $false; $btnPatchFile.Enabled = $false }
+    if ($script:PatchBusy) { foreach ($b in @($btnPatch, $btnPatchFile, $btnLibDL)) { $b.Enabled = $false } }
+
+    if (-not $busy -and -not $pBusy -and -not $script:Active -and -not $script:PatchBusy) {
+        if ($pt -and $pt.Local -and $thisPc) { $libStatusLbl.Text = "קובץ עדכון לגרסה $($pt.To) מוכן בתיקייה"; $libProgBar.Value = 100 }
+        elseif ($pt -and $pt.Local) { $libStatusLbl.Text = "קבצי העדכון מגרסה $from לגרסה $($pt.To) מוכנים בתיקייה - העתק אותם יחד עם התוכנה"; $libProgBar.Value = 100 }
+        elseif ($libProgBar.Value -eq 100 -and $libStatusLbl.Text -like 'קבצי העדכון מגרסה*') { $libStatusLbl.Text = ''; $libProgBar.Value = 0 }
+        elseif ($t -and $t.Ready) { $libStatusLbl.Text = "חבילת הספרייה ($($t.Version)) מוכנה בתיקייה, ליד קובץ ההתקנה"; $libProgBar.Value = 100 }
     }
     Apply-ThemeTo $libCard
 }
@@ -1286,6 +1701,7 @@ function Refresh-LocalInfo {
         $script:SelectedLocalFile = $(if ($loc.Count -gt 0) { $loc[0] } else { $null })
     }
     Update-StatusBar
+    Update-PatchFromList
     Update-AllUI
 }
 
@@ -1297,6 +1713,8 @@ function Refresh-Data {
     try { $script:Releases = @(Get-AppReleases); $script:Online = $true }
     catch { $script:Releases = @(); $script:Online = $false; $netError = $_.Exception.Message }
     try { if ($script:Online) { $script:LibLatest = Get-LatestLibraryRelease } } catch { $script:LibLatest = $null }
+    try { if ($script:Online) { $script:PatchEdges = @(Get-LibraryPatchEdges) } } catch { $script:PatchEdges = @() }
+    Update-PatchFromList
     $lblNetwork.Visible = -not $script:Online
     if (-not $script:Online -and $netError) { $lblNetwork.Text = "אין חיבור לשרת: $netError" }
     $cmbChannel.Items.Clear()
@@ -1322,6 +1740,11 @@ $cmbChannel.Add_SelectedIndexChanged({
 $cmbArch.Add_SelectedIndexChanged({ Update-AllUI })
 foreach ($r in @($radioInstaller, $radioPortable, $radioFull, $radioLocal)) { $r.Add_CheckedChanged({ if ($this.Checked) { $statusLbl.Text = ''; Update-AppUI } }) }
 $chkIndex.Add_CheckedChanged({ Update-LibUI })
+$cmbPatchFrom.Add_SelectedIndexChanged({
+    if ($script:PatchFromUpdating) { return }
+    if (-not $script:Active -and -not $script:Paused.ContainsKey('Lib')) { $libStatusLbl.Text = ''; $libProgBar.Value = 0 }
+    Update-LibUI
+})
 
 # "יומן שינויים" של אוצריא - הקובץ assets/יומן שינויים.md שבתוך התוכנה.
 # מבנה: "* **0.9.98.3**" ואחריו שורות "  - חידוש". מחזיר רשימת @{ Version; Items }.
@@ -1485,8 +1908,164 @@ $btnLibDL.Add_Click({
         }
     }
 })
-$btnLibCancel.Add_Click({ Cancel-Download 'Lib' })
+$btnLibCancel.Add_Click({
+    $k = if (($script:Active -and $script:Active.Kind -eq 'Patch') -or $script:Paused.ContainsKey('Patch')) { 'Patch' } else { 'Lib' }
+    Cancel-Download $k
+})
 
+$script:PatchBusy = $false
+function Install-LibraryPatch($Steps) {
+    $lib = $script:Library
+    if (-not $lib -or -not $lib.Version) { Show-RTLMessageBox 'לא נמצאה ספרייה במחשב שאפשר לעדכן.' 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return }
+    # Read and chain-check every manifest before touching anything
+    $plan = @(); $expect = [int]$lib.Version; $maxUnc = 0L
+    foreach ($st in @($Steps)) {
+        if (-not (Test-Path -LiteralPath $st.Manifest)) {
+            Show-RTLMessageBox "חסר קובץ התיאור של העדכון:`n$(Split-Path -Leaf $st.Manifest)`n`nיש להעתיק אותו יחד עם קובץ העדכון (הם יורדים יחד)." 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return
+        }
+        try { $mj = [IO.File]::ReadAllText($st.Manifest, [Text.Encoding]::UTF8); $m = ConvertFrom-Json -InputObject $mj }
+        catch { Show-RTLMessageBox "קובץ התיאור של העדכון פגום:`n$(Split-Path -Leaf $st.Manifest)`n$($_.Exception.Message)" 'עדכון ספרייה' 'OK' 'Error' | Out-Null; return }
+        if ([int]$m.fromVersion -ne $expect) {
+            $what = if ($plan.Count -eq 0) { "הספרייה במחשב בגרסה $expect" } else { "הקובץ הקודם מעדכן לגרסה $expect" }
+            Show-RTLMessageBox "קובץ העדכון $(Split-Path -Leaf $st.Path) מיועד לספרייה בגרסה $($m.fromVersion), אבל $what." 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return
+        }
+        $pf = @($m.patchFiles)[0]; if ($pf -and [long]$pf.uncompressedSize -gt $maxUnc) { $maxUnc = [long]$pf.uncompressedSize }
+        $plan += [pscustomobject]@{ Zst = $st.Path; Json = $mj; From = [int]$m.fromVersion; To = [int]$m.toVersion }
+        $expect = [int]$m.toVersion
+    }
+    if ($plan.Count -eq 0) { return }
+    $target = $plan[-1].To
+    $zstd = if ($script:Install) { Join-Path $script:Install.Dir 'zstd.exe' } else { $null }
+    if (-not $zstd -or -not (Test-Path -LiteralPath $zstd)) {
+        Show-RTLMessageBox 'כדי להתקין עדכון ספרייה צריך שאוצריא תהיה מותקנת במחשב (התוכנה משתמשת בכלי הפתיחה שמגיע איתה).' 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return
+    }
+    try { if ((Get-Item -LiteralPath $lib.Db).IsReadOnly) { Show-RTLMessageBox "קובץ הספרייה מסומן ""קריאה בלבד"" ולכן אי אפשר לעדכן אותו:`n$($lib.Db)" 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return } } catch { }
+    $need = $maxUnc * 3
+    try {
+        $free = (New-Object IO.DriveInfo([IO.Path]::GetPathRoot($lib.Db))).AvailableFreeSpace
+        if ($free -lt $need -and (Show-RTLMessageBox "ייתכן שאין מספיק מקום פנוי בכונן של הספרייה (נדרש בערך $(Format-Size $need), פנוי $(Format-Size $free)). להמשיך?" 'מקום בדיסק' 'YesNo' 'Warning') -ne 'Yes') { return }
+    } catch { }
+    $chain = if ($plan.Count -gt 1) { "`n(בשלבים: " + (($plan | ForEach-Object { "$($_.From)→$($_.To)" }) -join ', ') + ')' } else { '' }
+    $msg = "לעדכן את הספרייה מגרסה $($lib.Version) לגרסה $target?$chain`n`n" +
+           "• יש לסגור את אוצריא בזמן ההתקנה.`n• אם משהו ייכשל באמצע - הספרייה תישאר בגרסה האחרונה שהושלמה, תקינה.`n• בפתיחה הבאה אוצריא תעדכן את אינדקס החיפוש של הספרים שהשתנו."
+    if ((Show-RTLMessageBox $msg 'עדכון ספרייה' 'YesNo' 'Question') -ne 'Yes') { return }
+    if (-not (Confirm-CloseOtzaria 'יש לסגור אותה לפני עדכון הספרייה.')) { $libStatusLbl.Text = 'העדכון בוטל - אוצריא עדיין פתוחה'; return }
+
+    $script:PatchBusy = $true
+    Update-LibUI
+    $libProgBar.Value = 0; $libStatusLbl.Text = 'מתחיל...'
+    try { [TBProg]::SetState($form.Handle, 2) } catch { }
+    $dirs = ConvertTo-Json -InputObject @(Get-IndexDirs) -Compress
+    $books = 0; $err = $null; $reached = [int]$lib.Version; $n = 0
+    try {
+        foreach ($p in $plan) {
+            $n++
+            $prefix = if ($plan.Count -gt 1) { "($n/$($plan.Count)) " } else { '' }
+            $job = Start-Job -ScriptBlock $script:PatchWorker -ArgumentList $lib.Db, $p.Zst, $p.Json, $zstd, $script:SqliteCs, $dirs
+            $result = $null
+            try {
+                while ($true) {
+                    [Windows.Forms.Application]::DoEvents()
+                    $terminal = $job.State -in @('Completed', 'Failed', 'Stopped')
+                    foreach ($line in @(Receive-Job -Job $job -ErrorAction SilentlyContinue)) {
+                        $s = [string]$line
+                        if ($s -match '^PCT:(\d+)$') {
+                            $pct = [int](((($n - 1) * 100) + [int]$matches[1]) / $plan.Count)
+                            $libProgBar.Value = $pct; try { [TBProg]::SetVal($form.Handle, $pct, 100) } catch { }
+                        }
+                        elseif ($s.StartsWith('STAGE:')) { $libStatusLbl.Text = $prefix + $s.Substring(6) }
+                        elseif ($s -match '^DONE:(\d+)$') { $result = [int]$matches[1] }
+                        elseif ($s.StartsWith('ERROR:')) { $err = $s.Substring(6) }
+                    }
+                    if ($terminal) { break }
+                    Start-Sleep -Milliseconds 120
+                }
+                if ($null -eq $result -and -not $err) {
+                    $err = 'תהליך ההתקנה הסתיים באופן לא צפוי.'
+                    try { $r = $job.ChildJobs[0].JobStateInfo.Reason.Message; if ($r) { $err += " $r" } } catch { }
+                }
+            } finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+            if ($err) { break }
+            $books += $result; $reached = $p.To
+        }
+    } finally {
+        $script:PatchBusy = $false
+        try { [TBProg]::SetState($form.Handle, 0) } catch { }
+    }
+    $extra = if ($books -gt 0) { "`n$books ספרים השתנו - אוצריא תעדכן את אינדקס החיפוש שלהם בפתיחה הבאה." } else { '' }
+    if ($err) {
+        $libProgBar.Value = 0
+        if ($reached -gt [int]$lib.Version) {
+            $libStatusLbl.Text = "העדכון הושלם חלקית - הספרייה בגרסה $reached"
+            Show-RTLMessageBox "הספרייה עודכנה לגרסה $reached, אבל השלב הבא נכשל:`n$err$extra" 'עדכון ספרייה' 'OK' 'Warning' | Out-Null
+        } else {
+            $libStatusLbl.Text = 'עדכון הספרייה נכשל - הספרייה לא שונתה'
+            Show-RTLMessageBox "עדכון הספרייה נכשל:`n$err" 'עדכון ספרייה' 'OK' 'Error' | Out-Null
+        }
+    } else {
+        $libProgBar.Value = 100; $libStatusLbl.Text = "הספרייה עודכנה לגרסה $target"
+        Show-RTLMessageBox "הספרייה עודכנה בהצלחה לגרסה $target!$extra" 'עדכון ספרייה' | Out-Null
+    }
+    Refresh-LocalInfo
+}
+
+$btnPatch.Add_Click({
+    if ($script:Active -and $script:Active.Kind -eq 'Patch') { Stop-Download 'Patch'; return }
+    if ($script:Paused.ContainsKey('Patch')) {
+        $p = $script:Paused['Patch']
+        Start-Download -Kind 'Patch' -Items $p.Items -Bar $libProgBar -Label $libStatusLbl -OnDone $p.OnDone -Context $p.Context
+        return
+    }
+    $from = Get-PatchFromVersion
+    $pt = Get-PatchTarget $from
+    if (-not $pt) { return }
+    $thisPc = Test-PatchForThisPc $from
+    if ($pt.Local) {
+        if ($thisPc) { Install-LibraryPatch $pt.Steps }
+        else { Start-Process explorer.exe -ArgumentList "/select,`"$(@($pt.Steps)[0].Path)`"" }
+        return
+    }
+    $ctx = [pscustomobject]@{ Target = $pt; ThisPc = $thisPc }
+    Start-Download -Kind 'Patch' -Items $pt.Items -Bar $libProgBar -Label $libStatusLbl -Context $ctx -OnDone {
+        param($ctx)
+        $t = $ctx.Target
+        $files = (@($t.Steps) | ForEach-Object { '• ' + (Split-Path -Leaf $_.Path) + "`n• " + (Split-Path -Leaf $_.Manifest) }) -join "`n"
+        if ($ctx.ThisPc) {
+            $libStatusLbl.Text = "קבצי העדכון לגרסה $($t.To) הורדו"
+            $q = "קבצי העדכון הורדו (גרסה $($t.From) ← $($t.To)).`n`nלהתקין אותם עכשיו?"
+            if ((Show-RTLMessageBox $q 'עדכון ספרייה' 'YesNo' 'Question') -eq 'Yes') { Install-LibraryPatch $t.Steps }
+        } else {
+            $libStatusLbl.Text = "קבצי העדכון מגרסה $($t.From) לגרסה $($t.To) מוכנים בתיקייה - העתק אותם יחד עם התוכנה"
+            $exe = 'OtzariaUpdater.exe'
+            $q = "קבצי העדכון מגרסה $($t.From) לגרסה $($t.To) הורדו לתיקייה:`n$($script:WorkDir)`n`n$files`n`n" +
+                 "כדי לעדכן מחשב בלי אינטרנט:`n1. העתק את הקבצים האלה יחד עם $exe לאותה תיקייה (למשל בדיסק און קי).`n" +
+                 "2. במחשב השני הפעל את $exe מאותה תיקייה ולחץ ""התקנת העדכון"".`n   (או לחץ שם ""בחר קבצי עדכון..."" ובחר את כל קבצי ה-patch.)`n`nלפתוח את התיקייה?"
+            if ((Show-RTLMessageBox $q 'עדכון למחשב אחר' 'YesNo' 'Information') -eq 'Yes') { Start-Process explorer.exe -ArgumentList "/select,`"$(@($t.Steps)[0].Path)`"" }
+        }
+    }
+})
+
+$btnPatchFile.Add_Click({
+    $ofd = New-Object Windows.Forms.OpenFileDialog
+    $ofd.Filter = 'עדכון ספרייה (patch-*.db.zst)|patch-*.db.zst|כל הקבצים (*.*)|*.*'
+    $ofd.InitialDirectory = $script:WorkDir
+    $ofd.Multiselect = $true
+    $ofd.Title = 'בחר את קובץ העדכון (אם יש כמה - בחר את כולם)'
+    if ($ofd.ShowDialog() -ne 'OK') { return }
+    $sel = @()
+    foreach ($f in $ofd.FileNames) {
+        if ((Split-Path -Leaf $f) -notmatch $script:PatchRx) { Show-RTLMessageBox "זה אינו קובץ עדכון ספרייה:`n$(Split-Path -Leaf $f)`n(שם הקובץ צריך להיות בצורה patch-v40-v41.db.zst)" 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return }
+        $sel += [pscustomobject]@{ From = [int]$matches[1]; To = [int]$matches[2]; Name = $f; Size = (Get-Item -LiteralPath $f).Length }
+    }
+    # Order the chosen files into a chain starting at the local version (reaching the newest possible)
+    $lv = Get-LocalLibVersion
+    $path = $null
+    foreach ($to in @($sel | ForEach-Object { $_.To } | Sort-Object -Unique -Descending)) { $path = Find-PatchPath $sel $lv $to; if ($path) { break } }
+    if (-not $path) {
+        Show-RTLMessageBox "הקבצים שנבחרו אינם מתאימים לספרייה שבמחשב (גרסה $lv).`nנבחרו: $((@($sel) | ForEach-Object { "$($_.From)→$($_.To)" }) -join ', ')" 'עדכון ספרייה' 'OK' 'Warning' | Out-Null; return
+    }
+    Install-LibraryPatch @($path | ForEach-Object { [pscustomobject]@{ Path = $_.Name; Manifest = "$($_.Name).manifest.json" } })
+})
 # =====================================================================
 # Bottom buttons
 # =====================================================================
@@ -2585,6 +3164,10 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     param($s, $e)
+    if ($script:PatchBusy) {
+        Show-RTLMessageBox 'עדכון הספרייה עדיין מתבצע. יש להמתין לסיומו.' 'יציאה' 'OK' 'Warning' | Out-Null
+        $e.Cancel = $true; return
+    }
     if ($script:Active) {
         $r = Show-RTLMessageBox "הורדה עדיין פעילה. לעצור אותה ולצאת?`n(אפשר יהיה להמשיך את ההורדה בפעם הבאה)" 'יציאה' 'YesNo' 'Question'
         if ($r -ne 'Yes') { $e.Cancel = $true; return }
@@ -2595,5 +3178,5 @@ $form.Add_FormClosing({
     $timer.Stop()
 })
 
-$script:UiScale = Set-UiScale $form 720 905 0.9 (New-Object Drawing.Size(705, 868))
+$script:UiScale = Set-UiScale $form 720 947 0.9 (New-Object Drawing.Size(705, 910))
 if (-not $env:OTZ_UPDATER_NOUI) { [void]$form.ShowDialog() }
